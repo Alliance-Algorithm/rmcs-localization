@@ -18,15 +18,15 @@ concept orientation_wrapper_concept = requires() {
     Orientation {}.z();
 };
 
-inline void convert_orientation(
-    const orientation_wrapper_concept auto& src, orientation_struct_concept auto& dst) {
+inline auto convert_orientation(
+    const orientation_wrapper_concept auto& src, orientation_struct_concept auto& dst) -> void {
     dst.w = src.w();
     dst.x = src.x();
     dst.y = src.y();
     dst.z = src.z();
 }
-inline void convert_orientation(
-    const orientation_struct_concept auto& src, orientation_wrapper_concept auto& dst) {
+inline auto convert_orientation(
+    const orientation_struct_concept auto& src, orientation_wrapper_concept auto& dst) -> void {
     dst.w() = src.w;
     dst.x() = src.x;
     dst.y() = src.y;
@@ -47,12 +47,14 @@ concept vector3_wrapper_concept = requires {
     Vector3 {}.z();
 };
 
-inline void convert_translation(const vector3_wrapper_concept auto& src, vector3_struct_concept auto& dst) {
+inline auto convert_translation(
+    const vector3_wrapper_concept auto& src, vector3_struct_concept auto& dst) -> void {
     dst.x = src.x();
     dst.y = src.y();
     dst.z = src.z();
 }
-inline void convert_translation(const vector3_struct_concept auto& src, vector3_wrapper_concept auto& dst) {
+inline auto convert_translation(
+    const vector3_struct_concept auto& src, vector3_wrapper_concept auto& dst) -> void {
     dst.x() = src.x;
     dst.y() = src.y;
     dst.z() = src.z;

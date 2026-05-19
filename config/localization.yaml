@@ -1,29 +1,15 @@
 rmcs_localization:
   ros__parameters:
-    map_path: "/path/to/map.pcd"
+    map_path: "/tmp/point-lio/20260519_185527_223.pcd"
 
     frames:
       world: "world"
       odom: "odom"
-      base: "base_link"
 
     subscription:
-      pointcloud: "/cloud_registered"
-
-    publish:
-      robot_pose: "/rmcs_localization/pose"
-      tf: true
-
-    service:
-      relocalize: "/rmcs_localization/relocalize"
-
-    history:
-      enable: true
-      duration_sec: 10.0
-      sample_period_sec: 0.05
+      pointcloud: "/cloud_registered_undistort"
 
     registration:
-      receive_size: 2500
       initial_map_radius: 25.0
       coarse_iterations: 50
       precise_iterations: 500
@@ -39,19 +25,10 @@ rmcs_localization:
         mean_k: 50
         stddev_mul_thresh: 0.5
 
-    segmentation:
-      distance_threshold: 0.3
-      ground_max_height: 0.3
-      limit_distance: 50.0
-      limit_max_height: 10.0
-
-    default_pose:
-      translation:
-        x: 0.0
-        y: 0.0
-        z: 0.0
-      orientation:
-        w: 1.0
-        x: 0.0
-        y: 0.0
-        z: 0.0
+    initial_world_to_odom:
+      red:
+        t: [0.0, 0.0, 0.0]
+        q: [1.0, 0.0, 0.0, 0.0]
+      blue:
+        t: [0.0, 0.0, 0.0]
+        q: [0.0, 0.0, 0.0, 1.0]

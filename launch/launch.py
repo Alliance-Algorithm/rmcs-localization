@@ -8,7 +8,8 @@ def generate_launch_description():
         Node(
             package="rmcs_localization",
             executable="rmcs_localization",
-            parameters=[[FindPackageShare("rmcs_localization"), "/config", "/localization.yaml"]],
+            parameters=[[FindPackageShare("rmcs_localization"), "/config",
+                         "/localization.yaml"]],
             output="screen",
             respawn=True,
             respawn_delay=1.0,

@@ -1,4 +1,4 @@
-#include "util/segmentation.hpp"
+#include "util/segmentation.hh"
 
 #include <pcl/common/transforms.h>
 #include <pcl/filters/conditional_removal.h>
@@ -8,11 +8,11 @@
 
 #include <numbers>
 
-namespace {
+namespace rmcs {
+
+using namespace rmcs;
 
 constexpr auto kSegmentSizeLimit = std::size_t { 1'000 };
-
-}
 
 struct Segmentation::Impl {
     std::shared_ptr<PointCloud> source;
@@ -37,9 +37,11 @@ Segmentation::Segmentation()
 
 Segmentation::~Segmentation() = default;
 
-void Segmentation::set_input_source(const std::shared_ptr<PointCloud>& source) { pimpl->source = source; }
+auto Segmentation::set_input_source(const std::shared_ptr<PointCloud>& source) -> void {
+    pimpl->source = source;
+}
 
-std::shared_ptr<Segmentation::PointCloud> Segmentation::execute() {
+auto Segmentation::execute() -> std::shared_ptr<Segmentation::PointCloud> {
     auto outside_condition = std::make_shared<pcl::ConditionAnd<PointCloud::PointType>>();
     outside_condition->addComparison(std::make_shared<const pcl::FieldComparison<PointCloud::PointType>>(
         "x", pcl::ComparisonOps::GT, -pimpl->limit_distance / 2.0));
@@ -52,7 +54,7 @@ std::shared_ptr<Segmentation::PointCloud> Segmentation::execute() {
     outside_condition->addComparison(std::make_shared<const pcl::FieldComparison<PointCloud::PointType>>(
         "z", pcl::ComparisonOps::LT, pimpl->limit_max_height));
 
-    pcl::ConditionalRemoval<PointCloud::PointType> removal;
+    auto removal = pcl::ConditionalRemoval<PointCloud::PointType> {};
     removal.setCondition(outside_condition);
     removal.setInputCloud(pimpl->source);
 
@@ -95,7 +97,9 @@ std::shared_ptr<Segmentation::PointCloud> Segmentation::execute() {
     return output;
 }
 
-void Segmentation::set_limit_distance(double v) { pimpl->limit_distance = v; }
-void Segmentation::set_limit_max_height(double v) { pimpl->limit_max_height = v; }
-void Segmentation::set_distance_threshold(double v) { pimpl->segmentation_point_distance = v; }
-void Segmentation::set_ground_max_height(double v) { pimpl->ground_height = v; }
+auto Segmentation::set_limit_distance(double v) -> void { pimpl->limit_distance = v; }
+auto Segmentation::set_limit_max_height(double v) -> void { pimpl->limit_max_height = v; }
+auto Segmentation::set_distance_threshold(double v) -> void { pimpl->segmentation_point_distance = v; }
+auto Segmentation::set_ground_max_height(double v) -> void { pimpl->ground_height = v; }
+
+} // namespace rmcs

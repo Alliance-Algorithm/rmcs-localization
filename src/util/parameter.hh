@@ -18,13 +18,14 @@ public:
     }
 
     template <typename T>
-    T operator()(const std::string& name, T just_send_a_type_using_default_constructor = {}) const {
+    auto operator()(const std::string& name, T just_send_a_type_using_default_constructor = {}) const
+        -> T {
         (void)just_send_a_type_using_default_constructor;
         return get_parameter<T>(name);
     }
 
     template <typename T>
-    T get_parameter(const std::string& name) const {
+    auto get_parameter(const std::string& name) const -> T {
         auto value = T {};
         node.get_parameter(name, value);
         return value;
