@@ -1,6 +1,6 @@
 rmcs_localization:
   ros__parameters:
-    map_path: "/tmp/point-lio/20260519_185527_223.pcd"
+    map_path: "/root/红方原点合并补偿.pcd"
 
     frames:
       world: "world"
@@ -30,5 +30,5 @@ rmcs_localization:
         t: [0.0, 0.0, 0.0]
         q: [1.0, 0.0, 0.0, 0.0]
       blue:
-        t: [0.0, 0.0, 0.0]
+        t: [20.0, 0.0, 0.0]
         q: [0.0, 0.0, 0.0, 1.0]
