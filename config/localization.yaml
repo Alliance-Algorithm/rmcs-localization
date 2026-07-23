@@ -1,6 +1,8 @@
 rmcs_localization:
   ros__parameters:
-    map_path: "/root/红方原点合并补偿.pcd"
+    # map_path: "/workspaces/data/pcd/2026-rmuc/红方原点原始原点已纠正.pcd"
+    # map_path: "/workspaces/data/pcd/战队场地校准.pcd"
+    map_path: "/root/战队场地校准.pcd"
 
     frames:
       world: "world"
@@ -9,20 +11,25 @@ rmcs_localization:
     subscription:
       pointcloud: "/cloud_registered_undistort"
 
+    debug:
+      publish_registration_clouds: true
+
     registration:
+      type: "ICP"
       initial_map_radius: 25.0
       coarse_iterations: 50
       precise_iterations: 500
-      distance_threshold: 5.0
+      distance_threshold: 2.0
       threads: 8
       scan_angle: 15
       score_threshold: 0.01
+      accept_score_threshold: 0.05
       voxel_grid:
-        lx: 0.2
-        ly: 0.2
-        lz: 0.2
+        lx: 0.1
+        ly: 0.1
+        lz: 0.1
       outlier_removal:
-        mean_k: 50
+        mean_k: 20
         stddev_mul_thresh: 0.5
 
     initial_world_to_odom:

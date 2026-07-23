@@ -1,20 +1,187 @@
-#include "registration/engine.hh"
 #include "util/convert.hh"
-#include "util/fsm.hh"
 #include "util/logger.hh"
 #include "util/parameter.hh"
 
+#include <cmath>
+#include <numbers>
+
 #include <geometry_msgs/msg/transform_stamped.hpp>
 #include <pcl/common/transforms.h>
+#include <pcl/filters/statistical_outlier_removal.h>
+#include <pcl/filters/voxel_grid.h>
 #include <pcl/io/pcd_io.h>
 #include <pcl/kdtree/kdtree_flann.h>
 #include <pcl_conversions/pcl_conversions.h>
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
+#include <small_gicp/ann/kdtree_omp.hpp>
+#include <small_gicp/factors/icp_factor.hpp>
+#include <small_gicp/pcl/pcl_registration.hpp>
+#include <small_gicp/registration/reduction_omp.hpp>
+#include <small_gicp/registration/registration.hpp>
 #include <std_srvs/srv/trigger.hpp>
 #include <tf2_ros/static_transform_broadcaster.h>
 
 namespace rmcs {
+
+// 配准引擎：预处理（体素 + 离群点）+ ICP/GICP 配准 + 绕初值的 yaw 粗搜
+// ICP 使用 small_gicp 核心实现（多线程），GICP/VGICP 使用其 PCL 封装
+class Registration {
+public:
+    using PointT = pcl::PointXYZ;
+    using PointCloudT = pcl::PointCloud<PointT>;
+    using Icp = small_gicp::Registration<small_gicp::ICPFactor, small_gicp::ParallelReductionOMP>;
+
+    auto initialize(rclcpp::Node& node) -> void {
+        auto p = util::quick_paramtetr_reader{node};
+
+        type = p("registration.type", std::string{"ICP"});
+        distance_threshold = p("registration.distance_threshold", double{});
+        threads = p("registration.threads", int{});
+        coarse_iterations = p("registration.coarse_iterations", int{});
+        precise_iterations = p("registration.precise_iterations", int{});
+        scan_angle = p("registration.scan_angle", int{});
+        score_threshold = p("registration.score_threshold", double{});
+
+        if (type == "ICP") {
+            // point-to-point ICP：不利用平面结构，平行墙/地面对其无退化
+            icp = std::make_unique<Icp>();
+            icp->reduction.num_threads = threads;
+            icp->rejector.max_dist_sq = distance_threshold * distance_threshold;
+            icp->optimizer.max_iterations = coarse_iterations;
+        } else {
+            auto gicp = std::make_unique<small_gicp::RegistrationPCL<PointT, PointT>>();
+            gicp->setRegistrationType(type);
+            gicp->setNumThreads(threads);
+            gicp->setCorrespondenceRandomness(20);
+            gicp->setMaxCorrespondenceDistance(distance_threshold);
+            gicp->setMaximumIterations(coarse_iterations);
+            registration = std::move(gicp);
+        }
+
+        outlier_removal_filter = std::make_unique<pcl::StatisticalOutlierRemoval<PointT>>();
+        outlier_removal_filter->setMeanK(p("registration.outlier_removal.mean_k", int{}));
+        outlier_removal_filter->setStddevMulThresh(
+            p("registration.outlier_removal.stddev_mul_thresh", double{}));
+
+        voxel_grid_filter = std::make_unique<pcl::VoxelGrid<PointT>>();
+        voxel_grid_filter->setLeafSize(
+            p("registration.voxel_grid.lx", float{}), p("registration.voxel_grid.ly", float{}),
+            p("registration.voxel_grid.lz", float{}));
+    }
+
+    auto register_map(const std::shared_ptr<PointCloudT>& map) -> void {
+        preprocess(map);
+        if (icp) {
+            icp_target = map;
+            icp_target_tree = std::make_shared<small_gicp::KdTree<PointCloudT>>(
+                map, small_gicp::KdTreeBuilderOMP(threads));
+        } else {
+            registration->setInputTarget(map);
+        }
+    }
+
+    auto register_scan(const std::shared_ptr<PointCloudT>& scan) -> void {
+        preprocess(scan);
+        if (icp) {
+            icp_source = scan;
+        } else {
+            registration->setInputSource(scan);
+        }
+    }
+
+    // 绕初值位置做 yaw 粗搜，再用最优角度精配准
+    auto full_match(
+        const std::shared_ptr<PointCloudT>& align, const Eigen::Isometry3f& transformation)
+        -> void {
+        auto score_min = std::numeric_limits<double>::max();
+        auto angle_best = 0;
+
+        set_iterations(coarse_iterations);
+
+        for (auto n = 1; (scan_angle * n / 2) < 181; ++n) {
+            auto angle = static_cast<int>(scan_angle * static_cast<int>(n / 2) * std::pow(-1, n));
+            auto radian =
+                static_cast<float>(static_cast<float>(angle) / 180.0f * std::numbers::pi_v<float>);
+            auto rotation = Eigen::AngleAxisf{radian, Eigen::Vector3f::UnitZ()};
+            auto guess = Eigen::Isometry3d{(transformation * rotation).matrix().cast<double>()};
+
+            const auto [score, result] = align_and_score(align, guess);
+            if (score < score_min) {
+                score_min = score;
+                angle_best = angle;
+                last_transformation = Eigen::Isometry3f{result.matrix().cast<float>()};
+            }
+            if (score < score_threshold) {
+                break;
+            }
+        }
+
+        set_iterations(precise_iterations);
+
+        auto radian =
+            static_cast<float>(static_cast<float>(angle_best) / 180.0f * std::numbers::pi_v<float>);
+        auto rotation = Eigen::AngleAxisf{radian, Eigen::Vector3f::UnitZ()};
+        auto guess = Eigen::Isometry3d{(transformation * rotation).matrix().cast<double>()};
+
+        const auto [score, result] = align_and_score(align, guess);
+        last_score = score;
+        last_transformation = Eigen::Isometry3f{result.matrix().cast<float>()};
+    }
+
+    auto fitness_score() const -> double { return last_score; }
+
+    auto transformation() const -> Eigen::Isometry3f { return last_transformation; }
+
+private:
+    // 返回 {fitness(与 PCL 同语义：内点均方距离), 位姿}
+    auto align_and_score(const std::shared_ptr<PointCloudT>& align, const Eigen::Isometry3d& guess)
+        -> std::pair<double, Eigen::Isometry3d> {
+        if (icp) {
+            const auto result = icp->align(*icp_target, *icp_source, *icp_target_tree, guess);
+            const auto score = result.num_inliers > 0
+                ? 2.0 * result.error / static_cast<double>(result.num_inliers)
+                : std::numeric_limits<double>::max();
+            return {score, result.T_target_source};
+        }
+        registration->align(*align, Eigen::Matrix4f{guess.matrix().cast<float>()});
+        return {
+            registration->getFitnessScore(),
+            Eigen::Isometry3d{registration->getFinalTransformation().cast<double>()}};
+    }
+
+    auto set_iterations(int iterations) -> void {
+        if (icp) {
+            icp->optimizer.max_iterations = iterations;
+        } else {
+            registration->setMaximumIterations(iterations);
+        }
+    }
+
+    auto preprocess(const std::shared_ptr<PointCloudT>& cloud) -> void {
+        voxel_grid_filter->setInputCloud(cloud);
+        voxel_grid_filter->filter(*cloud);
+        outlier_removal_filter->setInputCloud(cloud);
+        outlier_removal_filter->filter(*cloud);
+    }
+
+    std::string type;
+    std::unique_ptr<pcl::Registration<PointT, PointT, float>> registration;
+    std::unique_ptr<Icp> icp;
+    std::shared_ptr<PointCloudT> icp_target;
+    std::shared_ptr<PointCloudT> icp_source;
+    std::shared_ptr<small_gicp::KdTree<PointCloudT>> icp_target_tree;
+    std::unique_ptr<pcl::StatisticalOutlierRemoval<PointT>> outlier_removal_filter;
+    std::unique_ptr<pcl::VoxelGrid<PointT>> voxel_grid_filter;
+    double distance_threshold{};
+    int threads{};
+    int scan_angle{};
+    int coarse_iterations{};
+    int precise_iterations{};
+    double score_threshold{};
+    double last_score{1.0};
+    Eigen::Isometry3f last_transformation{Eigen::Isometry3f::Identity()};
+};
 
 struct LocalizationNode : rclcpp::Node {
     using Point = pcl::PointXYZ;
@@ -29,6 +196,7 @@ struct LocalizationNode : rclcpp::Node {
         std::string map_path;
 
         double registration_radius;
+        double accept_score_threshold;
 
         Eigen::Isometry3f initial_world_from_odom_red;
         Eigen::Isometry3f initial_world_from_odom_blue;
@@ -47,6 +215,7 @@ struct LocalizationNode : rclcpp::Node {
             map_path = p("map_path", std::string{});
 
             registration_radius = p("registration.initial_map_radius", double{});
+            accept_score_threshold = p("registration.accept_score_threshold", double{});
 
             initial_world_from_odom_red =
                 read_transform(node, "initial_world_to_odom.red.t", "initial_world_to_odom.red.q");
@@ -80,16 +249,6 @@ struct LocalizationNode : rclcpp::Node {
 
     static constexpr auto kCollectDuration = std::chrono::duration<double>{2.0};
 
-    enum class Status {
-        IDLE,
-        COLLECTING,
-        LOCALIZING,
-        LOCALIZED,
-        FAILED,
-        END,
-    };
-    util::Fsm<Status> fsm{Status::IDLE};
-
     Registration registration{};
     Config config;
 
@@ -100,24 +259,22 @@ struct LocalizationNode : rclcpp::Node {
 
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr origin_pointcloud_publisher;
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr mapped_pointcloud_publisher;
+
     rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr pointcloud_subscription;
 
     rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr relocalize_red_service;
     rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr relocalize_blue_service;
-    rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr relocalize_lost_service;
 
     std::shared_ptr<PointCloud> standard_map = std::make_shared<PointCloud>();
     std::shared_ptr<PointCloud> latest_scan = std::make_shared<PointCloud>();
     std::shared_ptr<PointCloud> latest_origin_pointcloud = std::make_shared<PointCloud>();
     std::shared_ptr<PointCloud> latest_mapped_pointcloud = std::make_shared<PointCloud>();
     std::size_t collected_scan_frames = 0;
-    std::optional<std::chrono::steady_clock::time_point> collect_start_time;
 
-    std::atomic<bool> collecting_enabled = false;
-    std::atomic<bool> is_localizing = false;
-    std::optional<Eigen::Isometry3f> current_world_from_odom;
+    // 收集状态：collecting 期间订阅回调积累点云，首帧到达才开始计时
+    bool collecting = false;
+    std::optional<std::chrono::steady_clock::time_point> collect_start_time;
     std::optional<Eigen::Isometry3f> initial_transform;
-    std::optional<Eigen::Isometry3f> pending_world_from_odom;
 
     LocalizationNode()
         : rclcpp::Node("rmcs_localization", rmcs::util::NodeOptions{})
@@ -138,15 +295,15 @@ struct LocalizationNode : rclcpp::Node {
         pointcloud_subscription = create_subscription<sensor_msgs::msg::PointCloud2>(
             config.pointcloud_topic, rclcpp::SensorDataQoS(),
             [this](const sensor_msgs::msg::PointCloud2::ConstSharedPtr& msg) {
-                if (!collecting_enabled.load(std::memory_order_relaxed)) {
+                if (!collecting) {
                     return;
+                }
+                if (!collect_start_time.has_value()) {
+                    collect_start_time = std::chrono::steady_clock::now();
                 }
 
                 auto cloud = std::make_shared<PointCloud>();
                 pcl::fromROSMsg(*msg, *cloud);
-                if (!latest_scan) {
-                    latest_scan = std::make_shared<PointCloud>();
-                }
                 *latest_scan += *cloud;
                 ++collected_scan_frames;
                 log::info(
@@ -172,100 +329,22 @@ struct LocalizationNode : rclcpp::Node {
                 handle_relocalize_service("blue", *response);
             });
 
-        relocalize_lost_service = create_service<std_srvs::srv::Trigger>(
-            "/rmcs_localization/relocalize/lost",
-            [this](
-                const std::shared_ptr<std_srvs::srv::Trigger::Request>& request,
-                const std::shared_ptr<std_srvs::srv::Trigger::Response>& response) {
-                std::ignore = request;
-                handle_relocalize_service("lost", *response);
-            });
-
-        install_fsm();
-
         log::info(
             "initialized with map=%s, pointcloud_topic=%s, frames=(%s -> %s)",
             config.map_path.c_str(), config.pointcloud_topic.c_str(), config.world_frame.c_str(),
             config.odom_frame.c_str());
 
         using namespace std::chrono_literals;
-        runtime_timer = create_wall_timer(50ms, [this] { fsm.spin_once(); });
+        runtime_timer = create_wall_timer(50ms, [this] { spin_once_runtime(); });
         debug_pointcloud_timer = create_wall_timer(1s, [this] { publish_debug_pointclouds(); });
-    }
-
-    auto install_fsm() -> void {
-        fsm.use<Status::IDLE>(
-            [this] { collecting_enabled.store(false, std::memory_order_relaxed); },
-            [] { return Status::IDLE; });
-
-        fsm.use<Status::COLLECTING>(
-            [this] {
-                collecting_enabled.store(true, std::memory_order_relaxed);
-                latest_scan = std::make_shared<PointCloud>();
-                collected_scan_frames = 0;
-                collect_start_time = std::chrono::steady_clock::now();
-                log::info(
-                    "started collecting relocalization pointclouds for %.1f seconds",
-                    kCollectDuration.count());
-            },
-            [this] {
-                if (collect_start_time.has_value()
-                    && (std::chrono::steady_clock::now() - *collect_start_time) >= kCollectDuration
-                    && latest_scan && !latest_scan->empty()) {
-                    log::info(
-                        "finished collecting relocalization pointclouds: frames=%zu, points=%zu",
-                        collected_scan_frames, latest_scan->size());
-                    return Status::LOCALIZING;
-                }
-                return Status::COLLECTING;
-            });
-
-        fsm.use<Status::LOCALIZING>(
-            [this] {
-                collecting_enabled.store(false, std::memory_order_relaxed);
-                is_localizing.store(true, std::memory_order_relaxed);
-                log::info(
-                    "starting relocalization with scan_points=%zu and map_radius=%.3f",
-                    latest_scan ? latest_scan->size() : 0, config.registration_radius);
-                relocalize_once();
-                is_localizing.store(false, std::memory_order_relaxed);
-            },
-            [this] {
-                if (pending_world_from_odom.has_value()) {
-                    current_world_from_odom = pending_world_from_odom;
-                    const auto translation = current_world_from_odom->translation();
-                    log::info(
-                        "relocalization succeeded: world_from_odom translation=(%.3f, %.3f, %.3f)",
-                        translation.x(), translation.y(), translation.z());
-                    pending_world_from_odom.reset();
-                    return Status::LOCALIZED;
-                }
-                return Status::FAILED;
-            });
-
-        fsm.use<Status::LOCALIZED>([this] { publish_outputs(); }, [] { return Status::LOCALIZED; });
-
-        fsm.use<Status::FAILED>(
-            [] { log::warn("relocalization failed !!!"); }, [] { return Status::FAILED; });
-
-        if (!fsm.fully_registered()) {
-            throw std::runtime_error{"runtime fsm is not fully registered"};
-        }
     }
 
     auto
         handle_relocalize_service(std::string_view mode, std_srvs::srv::Trigger::Response& response)
             -> void {
-        if (mode == "lost") {
-            log::warn("received lost relocalization request, but lost mode is not implemented");
-            response.success = false;
-            response.message = "lost relocalization placeholder";
-            return;
-        }
-
-        if (is_localizing.load(std::memory_order_relaxed)) {
+        if (collecting) {
             log::warn(
-                "ignored %.*s relocalization request because localization is already running",
+                "ignored %.*s relocalization request because collection is in progress",
                 static_cast<int>(mode.size()), mode.data());
             response.success = false;
             response.message = "relocalization already in progress";
@@ -276,61 +355,84 @@ struct LocalizationNode : rclcpp::Node {
             "received %.*s relocalization request", static_cast<int>(mode.size()), mode.data());
         initial_transform = config.initial_world_to_odom(mode);
         latest_scan = std::make_shared<PointCloud>();
+        collected_scan_frames = 0;
         collect_start_time.reset();
-        pending_world_from_odom.reset();
-        fsm.start_on(Status::COLLECTING);
+        collecting = true;
 
         response.success = true;
         response.message = std::string{mode} + " relocalization started";
     }
 
-    auto relocalize_once() -> void {
-        try {
-            auto initial_world_from_odom =
-                current_world_from_odom.has_value()
-                    ? *current_world_from_odom
-                    : initial_transform.value_or(config.initial_world_to_odom("red"));
-            auto initial_guess = initial_world_from_odom;
-
-            auto center = Eigen::Vector3f{initial_guess.translation()};
-            auto local_map =
-                extract_pointcloud(standard_map, Point{center.x(), center.y(), center.z()});
-            registration.register_map(local_map);
-            latest_origin_pointcloud = local_map;
-
-            registration.register_scan(latest_scan);
-
-            auto aligned = std::make_shared<PointCloud>();
-            registration.full_match(aligned, initial_guess);
-
-            auto mapped_scan = std::make_shared<PointCloud>();
-            pcl::transformPointCloud(
-                *latest_scan, *mapped_scan, registration.transformation().matrix());
-            latest_mapped_pointcloud = mapped_scan;
-
-            pending_world_from_odom = Eigen::Isometry3f{registration.transformation()};
-            initial_transform.reset();
-        } catch (const std::exception& e) {
-            log::error("relocalization failed: %s", e.what());
-            pending_world_from_odom.reset();
-        }
-    }
-
-    auto publish_outputs() -> void {
-        if (!current_world_from_odom.has_value()) {
+    auto spin_once_runtime() -> void {
+        if (!collecting || !collect_start_time.has_value()) {
             return;
         }
+        if (std::chrono::steady_clock::now() - *collect_start_time < kCollectDuration) {
+            return;
+        }
+        collecting = false;
+        log::info(
+            "finished collecting relocalization pointclouds: frames=%zu, points=%zu",
+            collected_scan_frames, latest_scan->size());
+        relocalize_once();
+    }
+
+    auto relocalize_once() -> void {
+        // 服务入口已保证 initial_transform 有值
+        const auto initial_guess = *initial_transform;
+        initial_transform.reset();
+
+        auto center = Eigen::Vector3f{initial_guess.translation()};
+        auto local_map =
+            extract_pointcloud(standard_map, Point{center.x(), center.y(), center.z()});
+        registration.register_map(local_map);
+        latest_origin_pointcloud = local_map;
+
+        registration.register_scan(latest_scan);
+
+        auto aligned = std::make_shared<PointCloud>();
+        registration.full_match(aligned, initial_guess);
+
+        auto mapped_scan = std::make_shared<PointCloud>();
+        pcl::transformPointCloud(
+            *latest_scan, *mapped_scan, registration.transformation().matrix());
+        latest_mapped_pointcloud = mapped_scan;
+
+        // 配准质量验收：fitness 超阈值视为失败，不污染 TF
+        const auto score = registration.fitness_score();
+        log::info(
+            "relocalization fitness score: %.4f (accept threshold: %.4f)", score,
+            config.accept_score_threshold);
+        if (score > config.accept_score_threshold) {
+            log::error(
+                "relocalization rejected: fitness score %.4f exceeds accept threshold %.4f", score,
+                config.accept_score_threshold);
+            return;
+        }
+
+        // scan 在 odom 系、地图在 world 系，配准结果即 world->odom，广播一次即可
+        const auto world_from_odom = registration.transformation();
 
         auto msg = geometry_msgs::msg::TransformStamped{};
         msg.header.stamp = now();
         msg.header.frame_id = config.world_frame;
         msg.child_frame_id = config.odom_frame;
         util::convert_orientation(
-            Eigen::Quaternionf{current_world_from_odom->rotation()}, msg.transform.rotation);
+            Eigen::Quaternionf{world_from_odom.rotation()}, msg.transform.rotation);
         util::convert_translation(
-            Eigen::Translation3f{current_world_from_odom->translation()},
-            msg.transform.translation);
+            Eigen::Translation3f{world_from_odom.translation()}, msg.transform.translation);
         tf_broadcaster->sendTransform(msg);
+
+        const auto& R = world_from_odom.rotation();
+        const auto t = world_from_odom.translation();
+        constexpr auto deg = 180.0f / std::numbers::pi_v<float>;
+        const auto roll = std::atan2(R(2, 1), R(2, 2)) * deg;
+        const auto pitch = std::atan2(-R(2, 0), std::hypot(R(2, 1), R(2, 2))) * deg;
+        const auto yaw = std::atan2(R(1, 0), R(0, 0)) * deg;
+        log::info(
+            "relocalization succeeded: world_from_odom t=(%.3f, %.3f, %.3f) m, "
+            "rpy=(%.2f, %.2f, %.2f) deg",
+            t.x(), t.y(), t.z(), roll, pitch, yaw);
     }
 
     auto publish_debug_pointclouds() -> void {

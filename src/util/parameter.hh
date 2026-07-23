@@ -13,20 +13,18 @@ public:
     explicit quick_paramtetr_reader(rclcpp::Node& node)
         : node(node) {
         if (!node.get_node_options().automatically_declare_parameters_from_overrides()) {
-            throw std::runtime_error { "NodeOptions must auto-declare overridden parameters" };
+            throw std::runtime_error{"NodeOptions must auto-declare overridden parameters"};
         }
     }
 
     template <typename T>
-    auto operator()(const std::string& name, T just_send_a_type_using_default_constructor = {}) const
-        -> T {
-        (void)just_send_a_type_using_default_constructor;
+    auto operator()(const std::string& name, T = {}) const -> T {
         return get_parameter<T>(name);
     }
 
     template <typename T>
     auto get_parameter(const std::string& name) const -> T {
-        auto value = T {};
+        auto value = T{};
         node.get_parameter(name, value);
         return value;
     }

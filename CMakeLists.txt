@@ -72,8 +72,6 @@ endif()
 
 add_executable(rmcs_localization
     src/main.cc
-    src/registration/engine.cc
-    src/util/segmentation.cc
 )
 
 target_include_directories(rmcs_localization PRIVATE
