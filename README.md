@@ -39,16 +39,16 @@ ros2 launch rmcs_localization launch.py
 红方：
 
 ```bash
-ros2 service call /rmcs_localization/relocalize/red std_srvs/srv/Trigger
+echo red > /tmp/rmcs-localization/relocalize/trigger
 ```
 
 蓝方：
 
 ```bash
-ros2 service call /rmcs_localization/relocalize/blue std_srvs/srv/Trigger
+echo blue > /tmp/rmcs-localization/relocalize/trigger
 ```
 
-`/rmcs_localization/relocalize/lost` 当前仅为占位实现，不执行实际重定位。
+重定位结果（成功/失败 + 位姿）会写入 `/tmp/rmcs-navigation/relocalize/result`，由导航端监听并打印日志。
 
 ### 5. 查看输出
 

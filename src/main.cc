@@ -1,9 +1,21 @@
 #include "util/convert.hh"
 #include "util/logger.hh"
 #include "util/parameter.hh"
+#include "util/service.hh"
 
+#include <atomic>
+#include <chrono>
 #include <cmath>
+#include <fcntl.h>
+#include <format>
+#include <memory>
 #include <numbers>
+#include <optional>
+#include <string>
+#include <string_view>
+#include <thread>
+#include <tuple>
+#include <unistd.h>
 
 #include <geometry_msgs/msg/transform_stamped.hpp>
 #include <pcl/common/transforms.h>
@@ -19,7 +31,6 @@
 #include <small_gicp/pcl/pcl_registration.hpp>
 #include <small_gicp/registration/reduction_omp.hpp>
 #include <small_gicp/registration/registration.hpp>
-#include <std_srvs/srv/trigger.hpp>
 #include <tf2_ros/static_transform_broadcaster.h>
 
 namespace rmcs {
@@ -140,8 +151,8 @@ private:
         if (icp) {
             const auto result = icp->align(*icp_target, *icp_source, *icp_target_tree, guess);
             const auto score = result.num_inliers > 0
-                ? 2.0 * result.error / static_cast<double>(result.num_inliers)
-                : std::numeric_limits<double>::max();
+                                 ? 2.0 * result.error / static_cast<double>(result.num_inliers)
+                                 : std::numeric_limits<double>::max();
             return {score, result.T_target_source};
         }
         registration->align(*align, Eigen::Matrix4f{guess.matrix().cast<float>()});
@@ -262,8 +273,12 @@ struct LocalizationNode : rclcpp::Node {
 
     rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr pointcloud_subscription;
 
-    rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr relocalize_red_service;
-    rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr relocalize_blue_service;
+    // 重定位触发（FIFO）：导航端向 /tmp/rmcs-localization/relocalize/trigger 写入 "red"/"blue"
+    // FIFO 线程仅置原子 flag，实际状态切换由 executor 线程在 spin_once_runtime 中完成
+    std::thread service_thread;
+    std::atomic<bool> stop_service{false};
+    std::atomic<int> relocalize_request{0}; // 0=none, 1=red, 2=blue
+    std::string current_mode;               // 仅 executor 线程访问，无竞争
 
     std::shared_ptr<PointCloud> standard_map = std::make_shared<PointCloud>();
     std::shared_ptr<PointCloud> latest_scan = std::make_shared<PointCloud>();
@@ -311,23 +326,25 @@ struct LocalizationNode : rclcpp::Node {
                     collected_scan_frames, cloud->size(), latest_scan->size());
             });
 
-        relocalize_red_service = create_service<std_srvs::srv::Trigger>(
-            "/rmcs_localization/relocalize/red",
-            [this](
-                const std::shared_ptr<std_srvs::srv::Trigger::Request>& request,
-                const std::shared_ptr<std_srvs::srv::Trigger::Response>& response) {
-                std::ignore = request;
-                handle_relocalize_service("red", *response);
-            });
-
-        relocalize_blue_service = create_service<std_srvs::srv::Trigger>(
-            "/rmcs_localization/relocalize/blue",
-            [this](
-                const std::shared_ptr<std_srvs::srv::Trigger::Request>& request,
-                const std::shared_ptr<std_srvs::srv::Trigger::Response>& response) {
-                std::ignore = request;
-                handle_relocalize_service("blue", *response);
-            });
+        service_thread = std::thread{[this] {
+            auto service = util::make_service<"relocalize">(
+                util::make_action<"trigger">([this](std::string_view data) {
+                    if (data.starts_with("red")) {
+                        relocalize_request.store(1, std::memory_order_relaxed);
+                    } else if (data.starts_with("blue")) {
+                        relocalize_request.store(2, std::memory_order_relaxed);
+                    } else {
+                        log::warn(
+                            "unknown relocalize trigger: %.*s", static_cast<int>(data.size()),
+                            data.data());
+                    }
+                }));
+            log::info("relocalize trigger fifo at /tmp/rmcs-localization/relocalize/");
+            while (!stop_service.load(std::memory_order_relaxed)) {
+                service.spin_once();
+                std::this_thread::sleep_for(std::chrono::milliseconds{100});
+            }
+        }};
 
         log::info(
             "initialized with map=%s, pointcloud_topic=%s, frames=(%s -> %s)",
@@ -339,31 +356,30 @@ struct LocalizationNode : rclcpp::Node {
         debug_pointcloud_timer = create_wall_timer(1s, [this] { publish_debug_pointclouds(); });
     }
 
-    auto
-        handle_relocalize_service(std::string_view mode, std_srvs::srv::Trigger::Response& response)
-            -> void {
-        if (collecting) {
-            log::warn(
-                "ignored %.*s relocalization request because collection is in progress",
-                static_cast<int>(mode.size()), mode.data());
-            response.success = false;
-            response.message = "relocalization already in progress";
-            return;
-        }
-
-        log::info(
-            "received %.*s relocalization request", static_cast<int>(mode.size()), mode.data());
-        initial_transform = config.initial_world_to_odom(mode);
-        latest_scan = std::make_shared<PointCloud>();
-        collected_scan_frames = 0;
-        collect_start_time.reset();
-        collecting = true;
-
-        response.success = true;
-        response.message = std::string{mode} + " relocalization started";
+    ~LocalizationNode() {
+        stop_service.store(true, std::memory_order_relaxed);
+        if (service_thread.joinable())
+            service_thread.join();
     }
 
     auto spin_once_runtime() -> void {
+        // FIFO 线程只置原子 flag，状态切换在此（executor 线程）统一完成，无需任何锁
+        if (const auto request = relocalize_request.exchange(0, std::memory_order_relaxed);
+            request != 0) {
+            const auto mode = request == 1 ? "red" : "blue";
+            if (collecting) {
+                log::warn("ignored %s relocalization request: collection is in progress", mode);
+            } else {
+                log::info("received %s relocalization request", mode);
+                initial_transform = config.initial_world_to_odom(mode);
+                latest_scan = std::make_shared<PointCloud>();
+                collected_scan_frames = 0;
+                collect_start_time.reset();
+                current_mode = mode;
+                collecting = true;
+            }
+        }
+
         if (!collecting || !collect_start_time.has_value()) {
             return;
         }
@@ -403,11 +419,13 @@ struct LocalizationNode : rclcpp::Node {
         log::info(
             "relocalization fitness score: %.4f (accept threshold: %.4f)", score,
             config.accept_score_threshold);
+
+        auto localize_success = true;
         if (score > config.accept_score_threshold) {
             log::error(
                 "relocalization rejected: fitness score %.4f exceeds accept threshold %.4f", score,
                 config.accept_score_threshold);
-            return;
+            localize_success = false;
         }
 
         // scan 在 odom 系、地图在 world 系，配准结果即 world->odom，广播一次即可
@@ -421,7 +439,9 @@ struct LocalizationNode : rclcpp::Node {
             Eigen::Quaternionf{world_from_odom.rotation()}, msg.transform.rotation);
         util::convert_translation(
             Eigen::Translation3f{world_from_odom.translation()}, msg.transform.translation);
-        tf_broadcaster->sendTransform(msg);
+
+        if (localize_success)
+            tf_broadcaster->sendTransform(msg);
 
         const auto& R = world_from_odom.rotation();
         const auto t = world_from_odom.translation();
@@ -430,9 +450,26 @@ struct LocalizationNode : rclcpp::Node {
         const auto pitch = std::atan2(-R(2, 0), std::hypot(R(2, 1), R(2, 2))) * deg;
         const auto yaw = std::atan2(R(1, 0), R(0, 0)) * deg;
         log::info(
-            "relocalization succeeded: world_from_odom t=(%.3f, %.3f, %.3f) m, "
+            "relocalization result: world_from_odom t=(%.3f, %.3f, %.3f) m, "
             "rpy=(%.2f, %.2f, %.2f) deg",
             t.x(), t.y(), t.z(), roll, pitch, yaw);
+
+        // 结果经 FIFO 回传给导航端（导航端未启动时 open 失败，仅本地日志）
+        const auto text = localize_success
+                            ? std::format(
+                                  "SUCCESS mode={}, fitness={:.4f}, t=({:.3f}, {:.3f}, {:.3f}) m, "
+                                  "yaw={:.2f} deg",
+                                  current_mode, score, t.x(), t.y(), t.z(), yaw)
+                            : std::format(
+                                  "FAILED mode={}, fitness={:.4f} exceeds accept threshold {:.4f}",
+                                  current_mode, score, config.accept_score_threshold);
+        if (const auto fd = ::open("/tmp/rmcs-navigation/relocalize/result", O_WRONLY | O_NONBLOCK);
+            fd >= 0) {
+            std::ignore = ::write(fd, text.data(), text.size());
+            ::close(fd);
+        } else {
+            log::warn("failed to open relocalize result fifo");
+        }
     }
 
     auto publish_debug_pointclouds() -> void {

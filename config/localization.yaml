@@ -1,8 +1,8 @@
 rmcs_localization:
   ros__parameters:
     # map_path: "/workspaces/data/pcd/2026-rmuc/红方原点原始原点已纠正.pcd"
-    # map_path: "/workspaces/data/pcd/战队场地校准.pcd"
-    map_path: "/root/战队场地校准.pcd"
+    map_path: "/workspaces/data/pcd/战队场地校准.pcd"
+    # map_path: "/root/战队场地校准.pcd"
 
     frames:
       world: "world"
@@ -19,7 +19,7 @@ rmcs_localization:
       initial_map_radius: 25.0
       coarse_iterations: 50
       precise_iterations: 500
-      distance_threshold: 2.0
+      distance_threshold: 1.0
       threads: 8
       scan_angle: 15
       score_threshold: 0.01

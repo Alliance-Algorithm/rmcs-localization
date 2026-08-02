@@ -58,7 +58,6 @@ find_package(pcl_ros REQUIRED)
 find_package(PCL REQUIRED COMPONENTS common io filters segmentation registration)
 find_package(rclcpp REQUIRED)
 find_package(sensor_msgs REQUIRED)
-find_package(std_srvs REQUIRED)
 find_package(tf2 REQUIRED)
 find_package(tf2_eigen REQUIRED)
 find_package(tf2_geometry_msgs REQUIRED)
@@ -85,7 +84,6 @@ ament_target_dependencies(rmcs_localization
     pcl_ros
     rclcpp
     sensor_msgs
-    std_srvs
     tf2
     tf2_eigen
     tf2_geometry_msgs
