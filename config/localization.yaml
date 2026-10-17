@@ -1,7 +1,9 @@
 rmcs_localization:
   ros__parameters:
+    # 正式运行时由 launch/launch.py 以 find-pkg-share 覆盖为包内 map/ 目录，
+    # 不依赖开发机绝对路径；此处仅作直接运行节点时的兜底。
+    map_path: "/workspaces/RMCS/rmcs_ws/src/rmcs-navigation-deps/rmcs-localization/map/tcd-train.pcd"
     # map_path: "/workspaces/data/pcd/2026-rmuc/红方原点原始原点已纠正.pcd"
-    map_path: "/workspaces/data/pcd/战队场地校准.pcd"
     # map_path: "/root/战队场地校准.pcd"
 
     frames:
